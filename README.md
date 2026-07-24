@@ -17,10 +17,6 @@ A Command and Control (C2) framework with dashboard for red team operations.
 |------|-------------|
 | `c2_server.py` | Flask C2 server with web dashboard |
 | `zombie_payload.c` | C zombie payload for Linux/Windows |
-| `install_deps.sh` | Install build dependencies |
-| `build_linux.sh` | Compile Linux zombie payload |
-| `build_windows.sh` | Cross-compile Windows zombie payload |
-| `run_server.sh` | Start the C2 server |
 
 ## Prerequisites
 
@@ -32,17 +28,23 @@ pip3 install flask flask-socketio cryptography
 
 ## Build
 
+**Linux:**
 ```bash
-chmod +x install_deps.sh && ./install_deps.sh
-chmod +x build_linux.sh && ./build_linux.sh
-chmod +x build_windows.sh && ./build_windows.sh
+gcc -O2 -s -static -o zombie_linux zombie_payload.c -lpthread -lcurl
+upx --ultra-brute zombie_linux -o zombie_linux_obf
+```
+
+**Windows (cross-compile from Kali):**
+```bash
+x86_64-w64-mingw32-gcc -O2 -s -static -o zombie.exe zombie_payload.c -lws2_32 -lwininet -lpthread
+upx --ultra-brute zombie.exe -o zombie_obf.exe
 ```
 
 ## Usage
 
 1. Start the C2 server:
 ```bash
-chmod +x run_server.sh && ./run_server.sh
+python3 c2_server.py
 ```
 
 2. Access the dashboard at: `http://YOUR_KALI_IP:5000`
